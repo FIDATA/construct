@@ -2900,10 +2900,20 @@ def SymmetricMapping(subcon, mapping, default=NotImplemented):
     )
 
 
+#===============================================================================
+# booleans
+#===============================================================================
 @singletonfunction
-def Flag():
+def Flag(size = 1, truth = 1, falsehood = 0, default = True):
     r"""
-    A one byte (or one bit) field that maps to True or False bool. Non-zero bytes are consifered True.
+    A one or several bytes (or bits) field that maps to True or False bool.
+
+    By default non-zero values are considered True.
+
+    :param size: size in bytes (or bits) (1 by default)
+    :param truth: value mapped to Truth (1 by default)
+    :param falsehood: value mapped to False (0 by default)
+    :param default: default value. Set this to None to catch an exception when strict conformity is required
 
     Example::
 
@@ -2911,8 +2921,12 @@ def Flag():
         True
         >>> Flag.build(True)
         b'\x01'
+        >>> Flag(2, -1, 0).parse(b"\xFF\xFF")
+        True
+        >>> Flag(2, 1, 0).build(True)
+        b'\x00\x01'
     """
-    return SymmetricMapping(Byte, {True : 1, False : 0}, default=True)
+    return SymmetricMapping(Bytes(size), {True : truth, False : falsehood}, default=default)
 
 
 def Enum(subcon, default=NotImplemented, **mapping):
