@@ -7,6 +7,7 @@ from io import BytesIO, StringIO
 from binascii import hexlify, unhexlify
 import sys
 import collections
+from math import log2, ceil
 
 from construct.lib import *
 
@@ -83,6 +84,31 @@ def _write_stream(stream, length, data):
     written = stream.write(data)
     if written != length:
         raise FieldError("could not write bytes, written %d, should %d" % (written, length))
+
+
+#===============================================================================
+# Global alignment settings
+#===============================================================================
+globalalignment = 1
+
+r"""
+Set global alignment.
+
+Is is an analogue to C ``#pragma pack(n)`` and Pascal/Delphi ``{$ALIGN n}`` compiler directives.
+"""
+def setglobalalignment(alignment):
+    global globalalignment
+    if alignment not in (1, 2, 4, 8, 16, 32, 64):
+        raise ValueError('alignment should be power of 2', alignment)
+    globalalignment = alignment
+
+r"""
+Get natural alignment for data of specified size.
+"""
+def _natural_alignment(size):
+    if size == 0:
+        return 0
+    return 2 ** ceil(log2(size))
 
 
 #===============================================================================
@@ -276,6 +302,11 @@ class Construct(object):
         rhs = other.subcons if isinstance(other, Struct) else [other]
         return Struct(*(lhs + rhs))
 
+    def _natural_alignment(self, context = None):
+        return _natural_alignment(self.sizeof(context))
+
+    def _required_alignment(self, struct_alignment, context = None):
+        return min(struct_alignment, self._natural_alignment(context))
 
 class Subconstruct(Construct):
     r"""
@@ -299,6 +330,8 @@ class Subconstruct(Construct):
         return self.subcon._build(obj, stream, context, path)
     def _sizeof(self, context, path):
         return self.subcon._sizeof(context, path)
+    def _natural_alignment(self, context = None):
+        return self.subcon._natural_alignment(context)
 
 
 class Adapter(Subconstruct):
@@ -334,7 +367,7 @@ class SymmetricAdapter(Adapter):
 class Validator(SymmetricAdapter):
     r"""
     Abstract class: validates a condition on the encoded/decoded object.
-    
+
     Needs to implement ``_validate()`` that returns bool.
 
     :param subcon: the subcon to validate
@@ -553,6 +586,8 @@ class BytesInteger(Construct):
             return self.length(context) if callable(self.length) else self.length
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
+    def _natural_alignment(self, context = None):
+        return _natural_alignment(bytesize)
 
 
 class BitsInteger(Construct):
@@ -883,6 +918,8 @@ class Struct(Construct):
             return sum(sc._sizeof(context, path) for sc in self.subcons)
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
+    def _natural_alignment(self, context = None):
+        return max([i._natural_alignment() for i in self.subcons])
 
 
 class Sequence(Struct):
@@ -939,6 +976,8 @@ class Sequence(Struct):
                 if sc.name is not None:
                     context[sc.name] = buildret
                 context[i] = buildret
+    def _natural_alignment(self, context = None):
+        return max([i._natural_alignment() for i in self.subcons])
 
 
 #===============================================================================
@@ -1063,6 +1102,28 @@ def Array(count, subcon):
     return Range(count, count, subcon)
 
 
+CPackedArray = Array
+
+def CArray(count, subcon, alignment = None):
+    r"""
+    Makes an array where each item is aligned conforming to C/Pascal rules.
+
+    :param alignment: optional, passed to each member. By default globalalignment is used
+    :param count: int or a function that takes context and returns the number of elements
+    :param subcon: the subcon to process individual elements
+    """
+    if alignment is None:
+        alignment = globalalignment
+    if alignment == 1:
+        aligned_subcon = subcon
+    else:
+        required_alignment = subcon.required_alignment(alignment)
+        aligned_subcon = Aligned(required_alignment, subcon)
+    res = Array(count, aligned_subcon)
+    res.alignment = alignment
+    return res
+
+
 class PrefixedArray(Construct):
     r"""
     An array prefixed by a length field.
@@ -1095,6 +1156,8 @@ class PrefixedArray(Construct):
         self.lengthfield._build(len(obj), stream, context, path)
         for element in obj:
             self.subcon._build(element, stream, context, path)
+    def _natural_alignment(self, context = None):
+        return max(lengthfield._natural_alignment(context), subcon._natural_alignment(context))
 
 
 class RepeatUntil(Subconstruct):
@@ -1266,6 +1329,41 @@ def AlignedStruct(modulus, *subcons, **kw):
         8
     """
     return Struct(*[Aligned(modulus, sc, **kw) for sc in subcons])
+
+
+CPackedStruct = Struct
+
+def CStruct(alignment = None, *subcons):
+    r"""
+    Makes a structure where each field is aligned conforming to C/Pascal rules.
+
+    :param alignment: optional, passed to each member. By default globalalignment is used
+    :param \*subcons: the subcons that make up this structure
+    :param pattern: optional, keyword parameter passed to each member
+    """
+    if alignment is None:
+        alignment = globalalignment
+    if alignment == 1:
+        res = Struct(*subcons)
+    else:
+        aligned_subcons = []
+        if len(subcons) > 0:
+            max_alignment = subcons[-1].required_alignment(alignment)
+            for i in range(len(subcons) - 1):
+                required_alignment = subcons[i + 1].required_alignment(alignment)
+                if required_alignment > 0:
+                    max_alignment = max(max_alignment, required_alignment)
+                    aligned_subcon = Aligned(required_alignment, subcons[i])
+                else:
+                    aligned_subcon = subcons[i]
+                aligned_subcons.append(aligned_subcon)
+            # Add the last element padded to structure's own alignment
+            subcon = subcons[-1]
+            aligned_subcon = Aligned(max_alignment, subcons[-1])
+            aligned_subcons.append(aligned_subcon)
+        res = PackedStruct(*aligned_subcons)
+    res.alignment = alignment
+    return res
 
 
 def BitStruct(*subcons):
@@ -1481,6 +1579,8 @@ class Select(Construct):
                     _write_stream(stream, len(data), data)
                     return
         raise SelectError("no subconstruct matched", obj)
+    def _natural_alignment(self, context = None):
+        return max([i._natural_alignment() for i in self.subcons])
 
 
 def Optional(subcon):
@@ -1560,6 +1660,8 @@ class Switch(Construct):
             return sc._sizeof(context, path)
         except (KeyError, AttributeError):
             raise SizeofError("cannot calculate size, key not found in context")
+    def _natural_alignment(self, context = None):
+        return max([i._natural_alignment() for i in self.cases.values()])
 
 
 def IfThenElse(predicate, thensubcon, elsesubcon):
